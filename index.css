@@ -1,0 +1,324 @@
+@import "tailwindcss";
+
+.felt-background {
+  --felt-surface-rgb: 31, 60, 45;
+  --felt-separator-rgb: 49, 89, 66;
+  --felt-base: #13251d;
+  --felt-gradient: radial-gradient(circle at center, #35654d 0%, #13251d 100%);
+  background-color: var(--felt-base);
+  background-image: var(--felt-gradient);
+  background-attachment: fixed;
+}
+
+/* Fade overflowing content into the same viewport-aligned felt as the page. */
+.felt-footer::before {
+  content: "";
+  position: fixed;
+  inset: auto 0 0;
+  height: calc(52px + 2rem + max(1.25rem, env(safe-area-inset-bottom)));
+  z-index: -1;
+  pointer-events: none;
+  background-color: var(--felt-base);
+  background-image: var(--felt-gradient);
+  background-attachment: fixed;
+  mask-image: linear-gradient(to bottom, transparent, black 45%);
+}
+
+/* Frank: a single table tree with progressively visible desktop information. */
+.frank-workspace { position: relative; width: 100%; height: 100%; min-height: 0; }
+.frank-table-center { height: 100%; min-width: 0; display: flex; flex-direction: column; }
+.frank-info-toggle { position: absolute; top: max(1rem, env(safe-area-inset-top)); right: 1rem; z-index: 40; padding: .5rem; border-radius: 50%; color: #aaa; background: #0006; cursor: pointer; }
+.frank-information { display: none; }
+.frank-panel-tabs { display: flex; gap: 4px; padding: 10px; border-bottom: 1px solid #ffffff12; flex-shrink: 0; }
+.frank-panel-tabs button { padding: 8px 12px; border-radius: 8px; color: #ffffff70; cursor: pointer; font-size: 13px; }
+.frank-panel-tabs button[aria-pressed="true"] { color: #d4af37; background: #d4af3718; }
+.frank-panel-close { margin-left: auto; }
+.frank-panel-heading { display: none; }
+.frank-roster-panel, .frank-log-panel { min-height: 0; min-width: 0; flex: 1; flex-direction: column; }
+.frank-panel-content { min-height: 0; flex: 1; padding: 14px 10px; }
+.frank-workspace[data-panel="roster"] .frank-roster-panel,
+.frank-workspace[data-panel="log"] .frank-log-panel { display: flex; }
+.frank-workspace[data-panel="roster"] .frank-log-panel,
+.frank-workspace[data-panel="log"] .frank-roster-panel { display: none; }
+.frank-info-backdrop { position: absolute; inset: 0; z-index: 39; background: #0008; }
+.frank-workspace[data-layout="compact"][data-open="true"] .frank-information {
+  display: flex; flex-direction: column; position: absolute; z-index: 40;
+  right: 0; bottom: 0; width: min(100%, 480px); height: 82%;
+  padding-bottom: env(safe-area-inset-bottom); border-radius: 22px 22px 0 0;
+  background: #13251d; border: 1px solid #ffffff15;
+}
+.frank-workspace:not([data-layout="compact"]) {
+  display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 16px;
+  max-width: 1920px; margin-inline: auto; padding: 48px 20px 12px;
+}
+.frank-workspace:not([data-layout="compact"]) .frank-info-toggle { display: none; }
+.frank-workspace:not([data-layout="compact"]) .frank-table-center {
+  display: grid; grid-template-rows: minmax(244px, 25fr) minmax(160px, 41fr) minmax(240px, 34fr);
+  grid-column: 1; grid-row: 1; min-height: 0;
+  border: 1px solid #ffffff0d; border-radius: 24px; overflow: visible;
+}
+.frank-workspace:not([data-layout="compact"]) .frank-information {
+  display: flex; flex-direction: column; min-height: 0; grid-column: 2; grid-row: 1;
+  border: 1px solid #ffffff10; border-radius: 18px; background: #00000015;
+}
+.frank-workspace:not([data-layout="compact"]) :is(.frank-opponents-region, .frank-board-region, .frank-player-region) { min-height: 0; }
+.frank-workspace:not([data-layout="compact"]) :is(.frank-opponents-region, .frank-board-region, .frank-player-region) > section { height: 100%; }
+.frank-workspace:not([data-layout="compact"]) [data-frank-table] { container-type: inline-size; }
+.frank-workspace:not([data-layout="compact"]) [data-frank-player] { border-radius: 0 0 24px 24px; }
+.frank-workspace[data-layout="wide"] { grid-template-columns: 280px minmax(0, 1fr) 300px; }
+.frank-workspace[data-layout="wide"] .frank-table-center { grid-column: 2; }
+.frank-workspace[data-layout="wide"] .frank-information { display: contents; }
+.frank-workspace[data-layout="wide"] .frank-panel-tabs { display: none; }
+.frank-workspace[data-layout="wide"] :is(.frank-roster-panel, .frank-log-panel) {
+  display: flex; grid-row: 1; border: 1px solid #ffffff10; border-radius: 18px; background: #00000015;
+}
+.frank-workspace[data-layout="wide"] .frank-roster-panel { grid-column: 1; }
+.frank-workspace[data-layout="wide"] .frank-log-panel { grid-column: 3; }
+.frank-workspace[data-layout="wide"] .frank-panel-heading { display: block; padding: 16px 14px 0; color: #d4af37aa; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+@media (min-width: 1024px) and (max-height: 740px) {
+  .frank-workspace:not([data-layout="compact"]) { padding-top: 40px; padding-bottom: 8px; }
+  .frank-workspace:not([data-layout="compact"]) .frank-table-center { grid-template-rows: 244px minmax(125px, 1fr) 230px; }
+  .frank-workspace:not([data-layout="compact"]) [data-frank-player] .pointer-events-auto.text-\[7px\] { font-size: 10px; }
+}
+
+.frank-workspace:not([data-layout="compact"]) [data-frank-table] { gap: 10px; padding-block: 8px; }
+.frank-workspace:not([data-layout="compact"]) .frank-pot-display { position: relative; top: auto; margin: 0; flex-shrink: 0; }
+.frank-workspace:not([data-layout="compact"]) .frank-pot-display > span:first-child { font-size: 10px; }
+.frank-workspace:not([data-layout="compact"]) .frank-pot-display > span:last-child { font-size: 38px; }
+.frank-workspace:not([data-layout="compact"]) .frank-community-row { height: auto; margin-top: 0; margin-bottom: 24px; }
+.frank-workspace:not([data-layout="compact"]) .frank-winning-hand { bottom: 4px; }
+.frank-workspace:not([data-layout="compact"]) .frank-winning-hand > span { font-size: 12px; }
+.frank-information img { border-radius: 8px; }
+.frank-workspace:not([data-layout="compact"]) .frank-table-center { grid-template-columns: minmax(0, 1fr); }
+.frank-workspace :is(.frank-opponents-region, .frank-board-region, .frank-player-region) { min-width: 0; }
+/* Layout owns size changes; the original all-property transitions must not
+   trail a breakpoint and temporarily cover the adjacent information panel. */
+.frank-workspace :is(.frank-opponents-region, .frank-player-region) > section { transition-property: background-color, box-shadow, opacity; }
+
+/* Shared entry typography and copy; Frank changes only control surfaces. */
+[data-ui-style="frank"] .entry-primary:not(:disabled) {
+  background: #d4af37;
+  color: #171408;
+  border-radius: 14px;
+  box-shadow: 0 4px 20px #d4af371a;
+}
+[data-ui-style="frank"] .entry-primary:not(:disabled):hover { background: #e3c353; }
+[data-ui-style="frank"] .entry-secondary {
+  background: #151b17;
+  color: #d4af37;
+  border: 1px solid #d4af3766;
+  border-radius: 12px;
+}
+/* Reserve room for the original large portraits without pushing mobile actions below the viewport. */
+.frank-workspace[data-layout="compact"] [data-frank-table] {
+  height: calc(66svh - max(24svh, 244px));
+}
+
+/* Card scale follows the actual table, not the viewport's tablet breakpoint. */
+.frank-workspace [data-frank-table],
+.frank-workspace [data-frank-player] { container-type: inline-size; }
+.frank-workspace :is(.frank-board-card, .frank-community-card) {
+  font-size: clamp(5px, min(1.65cqw, 1svh), 12px);
+}
+.frank-workspace .frank-community-row { gap: clamp(4px, 1cqw, 12px); }
+.frank-workspace .frank-hole-card {
+  font-size: clamp(7px, min(1.8cqw, 1svh), 12px);
+}
+.frank-workspace .frank-pot-display > span:first-child { font-size: clamp(10px, 1.4cqw, 14px); }
+.frank-workspace .frank-pot-display > span:last-child { font-size: clamp(30px, 5cqw, 48px); }
+
+/* Frank's room selection: illustrated rooms with a quiet, dedicated roster rail. */
+[data-ui-style="frank"] .setup-page .setup-shell { max-width: 1440px; }
+[data-ui-style="frank"] .setup-venue-card { opacity: .85; }
+[data-ui-style="frank"] .setup-venue-card[aria-pressed="true"] { opacity: 1; }
+[data-ui-style="frank"] .setup-submit .entry-primary {
+  background: #f5f5f4; color: #151515; border-radius: 18px; box-shadow: none;
+}
+@media (min-width: 1024px) {
+  [data-ui-style="frank"] .setup-shell { padding: 16px 40px 48px; }
+  [data-ui-style="frank"] .setup-grid {
+    grid-template-columns: minmax(0, 1fr) 270px;
+    column-gap: 28px;
+    padding-top: 32px;
+    position: relative;
+  }
+  [data-ui-style="frank"] .setup-bankroll { padding: 0 0 28px 28px; border-left: 1px solid #ffffff20; }
+  [data-ui-style="frank"] .setup-roster { padding-left: 8px; border-left: 1px solid #ffffff20; align-self: stretch; }
+  [data-ui-style="frank"] .setup-venue-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+  [data-ui-style="frank"] .setup-venue-card {
+    grid-column: span 1; height: clamp(230px, 21vw, 280px); padding: 20px; border-radius: 24px;
+  }
+  [data-ui-style="frank"] .setup-venue-card > div { padding-right: 0; }
+  [data-ui-style="frank"] .setup-venue-card > div > div:first-child { font-size: 17px; }
+  [data-ui-style="frank"] .setup-venue-card img { height: 90%; right: -28%; bottom: -29%; }
+  [data-ui-style="frank"] .setup-roster > p { font-size: 12px; }
+  [data-ui-style="frank"] .setup-submit { margin-top: 16px; padding-top: 8px; }
+}
+
+[data-ui-style="frank"] .setup-venue-card img {
+  transform-origin: 65% 70%;
+  transition: transform 350ms ease;
+}
+[data-ui-style="frank"] .setup-venue-card[aria-pressed="true"] img {
+  transform: scale(1.14);
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-ui-style="frank"] .setup-venue-card img { transition: none; }
+}
+
+/* Frank Setup design tokens: shared geometry across enabled and disabled states. */
+[data-ui-style="frank"] .setup-page {
+  --setup-control-height: 52px;
+  --setup-control-radius: 16px;
+  --setup-icon-size: 40px;
+  --setup-card-radius: 24px;
+  --setup-gap: 14px;
+  --setup-card-height: clamp(230px, 21vw, 280px);
+  --setup-heading-height: 180px;
+}
+[data-ui-style="frank"] .setup-venue-card,
+[data-ui-style="frank"] .setup-venue-card:hover {
+  border: 0;
+  box-shadow: none;
+  border-radius: var(--setup-card-radius);
+}
+[data-ui-style="frank"] .setup-venue-card:focus-visible {
+  outline: 2px solid white;
+  outline-offset: 4px;
+}
+[data-ui-style="frank"] .setup-submit > button {
+  height: var(--setup-control-height);
+  min-height: var(--setup-control-height);
+  border-radius: var(--setup-control-radius);
+  width: 100%;
+  padding: 0 12px;
+  font-size: 14px;
+  line-height: 1.25;
+}
+[data-ui-style="frank"] .setup-page .entry-secondary {
+  width: var(--setup-icon-size);
+  height: var(--setup-icon-size);
+  border-radius: var(--setup-control-radius);
+  flex-shrink: 0;
+}
+@media (min-width: 1024px) {
+  [data-ui-style="frank"] .setup-grid {
+    height: calc(var(--setup-heading-height) + 2 * var(--setup-card-height) + var(--setup-gap));
+    flex: none;
+    grid-template-rows: 150px minmax(0, 1fr);
+    padding-top: 0;
+    margin-top: 32px;
+  }
+  [data-ui-style="frank"] .frank-setup-heading { height: var(--setup-heading-height); }
+  [data-ui-style="frank"] .setup-venue-grid { gap: var(--setup-gap); }
+  [data-ui-style="frank"] .setup-venue-card { height: var(--setup-card-height); }
+  [data-ui-style="frank"] .setup-roster { min-height: 0; height: 100%; }
+  [data-ui-style="frank"] .setup-roster > :not(.setup-seat-list) { flex-shrink: 0; }
+  [data-ui-style="frank"] .setup-seat-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: #ffffff30 transparent;
+  }
+  [data-ui-style="frank"] .setup-submit {
+    margin-top: auto;
+    padding-top: 16px;
+    padding-bottom: 0 !important;
+  }
+}
+
+/* Short mobile browser viewports must not center the board over seat bets. */
+@media (max-width: 639px) {
+  .offsuit-board-region {
+    padding-top: 12px;
+    padding-bottom: 8px;
+    min-height: min-content;
+    flex-shrink: 0;
+    justify-content: safe center;
+  }
+}
+
+/* Frank mobile: reserve separate space for seats, board and actions. */
+.frank-workspace [data-frank-player] button:not(:disabled) { color: #f5f5f5; }
+.frank-workspace [data-frank-player] button.border-emerald-500\/30 { background: #073d30; color: #66edbd; }
+.frank-workspace [data-frank-player] button.border-\[\#d4af37\]\/30 { background: #30280e; color: #eed46e; }
+.frank-workspace [data-frank-player] button.border-white\/10 { background: #252a27; border-color: #ffffff35; }
+@media (max-width: 1023px) {
+  .frank-workspace[data-layout="compact"] { overflow-y: auto; }
+  .frank-workspace[data-layout="compact"] .frank-table-center {
+    display: grid;
+    grid-template-rows: 220px minmax(170px, 1fr) minmax(250px, 34svh);
+    min-height: 100%;
+    height: auto;
+  }
+  .frank-workspace[data-layout="compact"] .frank-opponents-region > section { height: 220px; min-height: 220px; }
+  .frank-workspace[data-layout="compact"] [data-frank-table] {
+    height: 100%; min-height: 170px; padding: 12px 16px;
+    gap: 12px; justify-content: center;
+  }
+  .frank-workspace[data-layout="compact"] .frank-pot-chips { display: none; }
+  .frank-workspace[data-layout="compact"] .frank-pot-display {
+    position: relative; top: auto; margin: 0; flex-shrink: 0;
+  }
+  .frank-workspace[data-layout="compact"] .frank-community-row { height: auto; margin: 0; padding: 0; flex-shrink: 0; }
+  .frank-workspace[data-layout="compact"] .frank-winning-hand { position: relative; bottom: auto; }
+  .frank-workspace[data-layout="compact"] .frank-winning-hand > span {
+    display: block; font-size: 13px; letter-spacing: 0; padding: 6px 12px;
+  }
+  .frank-workspace[data-layout="compact"] [data-frank-player] { height: 100%; min-height: 250px; }
+}
+
+/* ══ A phone held sideways ══════════════════════════════════════════
+   Landscape leaves roughly 390px of height, and a game screen that
+   assumes a tall phone clips the parts you need most: the player's
+   own cards, and in Frank's layout the action buttons themselves.
+   Below ~560px of height the fixed bands — seats, board, controls —
+   compress so seats, board and buttons share the screen at once, and
+   the phone-wide column keeps a scroll for whatever is left over
+   instead of clipping it out of reach. Desktop layouts are untouched:
+   Frank's compact rules only ever apply under 1024px of width. */
+@media (max-height: 560px) {
+  /* Offsuit: sm:overflow-visible clips the column on any wide screen;
+     a short one is short whatever its width, so it scrolls again. */
+  .offsuit-game-column { overflow-y: auto; }
+
+  .offsuit-topbar { height: 32px; }
+
+  /* Seats: a smaller face, tighter type, a thinner bet row */
+  .offsuit-seat-caret { height: 6px; }
+  .offsuit-seat-avatar { width: 34px; height: 34px; margin-top: 2px; }
+  .offsuit-seat-name { margin-top: 2px; font-size: 11px; }
+  .offsuit-seat-stack { font-size: 13px; }
+  .offsuit-seat-bet { height: 24px; margin-top: 4px; }
+
+  /* Board: a capped row keeps the cards from growing tall; the pot steps back */
+  .offsuit-board-region { padding: 4px 20px; min-height: 112px; }
+  .offsuit-board-row { max-width: 280px; margin-inline: auto; }
+  .offsuit-pot-row { margin-top: 4px; min-height: 26px; }
+  .offsuit-pot { font-size: 22px; }
+
+  /* Controls: slimmer sizer and buttons, cards that stop growing tall.
+     The sizer line is empty until you raise — it gives its height back. */
+  .offsuit-sizer { height: 34px; }
+  .offsuit-sizer:empty { display: none; }
+  .offsuit-action-row button { height: 40px; }
+  .offsuit-player-cards { max-width: 170px; margin-top: 8px; gap: 8px; }
+  .offsuit-player-info { padding-block: 6px; border-radius: 18px; }
+  .offsuit-hero-avatar { width: 34px; height: 34px; }
+  .offsuit-hero-stack { font-size: 18px; }
+  .offsuit-hero-hand { font-size: 13px; }
+
+  /* Frank: the compact layout's three bands shrink to share the height */
+  .frank-workspace[data-layout="compact"] .frank-table-center {
+    grid-template-rows: 108px minmax(84px, 1fr) minmax(168px, 30svh);
+  }
+  .frank-workspace[data-layout="compact"] .frank-opponents-region > section { height: 108px; min-height: 108px; }
+  .frank-workspace[data-layout="compact"] [data-frank-table] { min-height: 84px; padding: 4px 12px; gap: 6px; }
+  .frank-workspace[data-layout="compact"] [data-frank-player] { min-height: 168px; }
+  .frank-workspace[data-layout="compact"] .frank-hero-avatar { width: 40px; height: 40px; }
+  .frank-workspace[data-layout="compact"] .frank-hero-stack { font-size: 14px; }
+  .frank-workspace[data-layout="compact"] .frank-seat-avatar { width: 48px; height: 48px; }
+  .frank-workspace[data-layout="compact"] .frank-action-grid button { padding-top: 8px; padding-bottom: 8px; }
+}

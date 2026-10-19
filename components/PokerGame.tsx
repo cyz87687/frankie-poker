@@ -1,0 +1,905 @@
+import { TableLayout as FrankTableLayout } from "./frank/TableLayout";
+import { useGameSettings } from "../services/gameSettings";
+import { AIStratum as FrankAIStratum } from "./frank/AIStratum";
+import { TableStratum as FrankTableStratum } from "./frank/TableStratum";
+import { ActionButton } from "./ActionButton";
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { AIStratum } from './AIStratum';
+import { TableStratum } from './TableStratum';
+import { PlayerStratum } from './PlayerStratum';
+import { TableRoster } from './TableRoster';
+import { HandLog } from './HandLog';
+import { generateDeck, initializeGame } from '../constants';
+import { GamePhase, GameState, PlayerAction, GameConfig, Player } from '../types';
+import { getAIDecision } from '../services/pokerAi';
+import { determineWinner } from '../services/pokerEvaluator';
+import { recordAction, startHandStats } from '../services/playerStats';
+import { entryKey, loadSeatStats, saveSessionStats } from '../services/seatStats';
+import { useLanguage } from '../services/i18n';
+import { isLocalGame } from '../services/localPractice';
+
+interface PokerGameProps {
+    config: GameConfig;
+    wealth: number; // bankroll outside the table
+    onWealthChange: (delta: number) => void;
+    onExit: (chipsOnTable: number) => void;
+    onOpenSettings: () => void;
+}
+
+export const PokerGame: React.FC<PokerGameProps> = ({ config, wealth, onWealthChange, onExit, onOpenSettings }) => {
+    const { t } = useLanguage();
+    const { settings } = useGameSettings();
+    // Centralized Game State
+    const [gameState, setGameState] = useState<GameState>(() => initializeGame(config));
+
+    // Transient state to show AI decision immediately before the delay/action execution
+    const [aiIntent, setAiIntent] = useState<{ playerId: string; action: string; amount?: number } | null>(null);
+
+    // Ready State
+    const [hasStarted, setHasStarted] = useState(false);
+
+    // Ref to prevent multiple AI calls for the same turn
+    const aiProcessingRef = useRef(false);
+
+    // Folded and done watching: play the rest of the hand without pauses, then deal the next
+    const [skipping, setSkipping] = useState(false);
+    const skippingRef = useRef(false);
+    skippingRef.current = skipping;
+
+    // --- LOGIC HELPERS ---
+
+    // Calculate the highest bet currently on the table for this street
+    const getCurrentHighBet = useCallback(() => {
+        return Math.max(...gameState.players.map(p => p.currentBet));
+    }, [gameState.players]);
+
+    const getAmountToCall = useCallback((playerId: string) => {
+        const player = gameState.players.find(p => p.id === playerId);
+        if (!player) return 0;
+        const highBet = getCurrentHighBet();
+        return highBet - player.currentBet;
+    }, [gameState.players, getCurrentHighBet]);
+
+    // Helper to determine position label based on offset from dealer
+    const getPositionLabel = (indexFromDealer: number, playerCount: number): string => {
+        if (playerCount === 2) {
+            // Heads Up: Dealer is SB, other is BB
+            return indexFromDealer === 0 ? 'SB' : 'BB';
+        }
+
+        if (indexFromDealer === 0) return 'BTN';
+        if (indexFromDealer === 1) return 'SB';
+        if (indexFromDealer === 2) return 'BB';
+
+        // Positions going backwards from Dealer
+        const distFromButton = playerCount - indexFromDealer;
+        if (distFromButton === 1) return 'CO'; // Cutoff is always before Button
+        if (distFromButton === 2 && playerCount >= 5) return 'HJ'; // Hijack is before Cutoff (if enough players)
+
+        // Positions going forwards from BB
+        const distFromBB = indexFromDealer - 2;
+        if (distFromBB === 1) return 'UTG';
+        return `UTG+${distFromBB - 1}`;
+    };
+
+    // --- GAME LOOP ACTIONS ---
+
+    // Initialize/Reset Hand
+    const startNewHand = useCallback(() => {
+        setAiIntent(null);
+        setSkipping(false);
+        setGameState(prevState => {
+            const newDeck = generateDeck();
+
+            // 1. Identify Valid Players (Chips > 0)
+            // originalIndex is preserved to map back to the main players array
+            const activePlayerIndices = prevState.players
+                .map((p, index) => ({ ...p, originalIndex: index }))
+                .filter(p => p.chips > 0)
+                .map(p => p.originalIndex);
+
+            // Check Game Over (Winner)
+            const humanIndex = prevState.players.findIndex(p => p.isHuman);
+            if (activePlayerIndices.length === 1 && activePlayerIndices[0] === humanIndex) {
+                return prevState;
+            }
+
+            // 2. Rotate Dealer *among active players*
+            let currentActiveDealerIndex = activePlayerIndices.findIndex(idx => idx === prevState.dealerIndex);
+
+            if (currentActiveDealerIndex === -1) {
+                // Previous dealer busted, find next available
+                const nextValid = activePlayerIndices.find(idx => idx > prevState.dealerIndex);
+                const nextValidIndex = nextValid !== undefined ? activePlayerIndices.indexOf(nextValid) : 0;
+                currentActiveDealerIndex = nextValidIndex;
+            } else {
+                currentActiveDealerIndex = (currentActiveDealerIndex + 1) % activePlayerIndices.length;
+            }
+
+            const newDealerRealIndex = activePlayerIndices[currentActiveDealerIndex];
+            const activeCount = activePlayerIndices.length;
+
+            // Tilt: an AI that just lost a big pot gets more aggressive for a few hands, then cools off
+            const nextTilt = (p: Player): Pick<Player, 'tilt' | 'handStartChips'> => {
+                if (p.isHuman || !p.persona) return { tilt: 1, handStartChips: p.chips };
+                const start = p.handStartChips ?? p.chips;
+                const lost = start - p.chips;
+                const bigLoss = lost > 0 && (lost >= config.blindBig * 20 || lost >= start * 0.3);
+                const cooled = 1 + ((p.tilt ?? 1) - 1) * 0.5;
+                return {
+                    tilt: bigLoss ? Math.max(cooled, p.persona.tiltFactor) : cooled,
+                    handStartChips: p.chips
+                };
+            };
+
+            // 3. Assign Roles & Positions
+            const updatedPlayers = prevState.players.map((p, i) => {
+                const isEliminated = p.chips <= 0;
+
+                if (isEliminated) {
+                    return {
+                        ...p,
+                        hand: [],
+                        isActive: false,
+                        status: 'ELIMINATED' as PlayerAction,
+                        position: '',
+                        isDealer: false,
+                        currentBet: 0
+                    };
+                }
+
+                // Determine position in the active ring relative to dealer
+                const activeIdx = activePlayerIndices.indexOf(i);
+
+                // Calculate clockwise distance from dealer (0 = Dealer, 1 = Left of Dealer, etc)
+                const offsetFromDealer = (activeIdx - currentActiveDealerIndex + activeCount) % activeCount;
+
+                const positionLabel = getPositionLabel(offsetFromDealer, activeCount);
+                const isDealer = (offsetFromDealer === 0);
+
+                const hand = [newDeck.pop()!, newDeck.pop()!];
+
+                return {
+                    ...p,
+                    hand,
+                    isActive: true,
+                    status: 'WAITING' as PlayerAction,
+                    position: positionLabel,
+                    isDealer: isDealer,
+                    currentBet: 0,
+                    reasoningHistory: [],
+                    stats: startHandStats(p.stats),
+                    ...nextTilt(p)
+                };
+            });
+
+            // 4. Post Blinds
+            // Find SB and BB indices based on relative offset
+            const sbOffset = activeCount === 2 ? 0 : 1; // HU: Dealer is SB
+            const bbOffset = activeCount === 2 ? 1 : 2; // HU: Non-Dealer is BB
+
+            const sbRealIndex = activePlayerIndices[(currentActiveDealerIndex + sbOffset) % activeCount];
+            const bbRealIndex = activePlayerIndices[(currentActiveDealerIndex + bbOffset) % activeCount];
+
+            const sbPlayer = updatedPlayers[sbRealIndex];
+            const sbVal = Math.floor(config.blindBig / 2);
+            const sbAmount = Math.min(sbVal, sbPlayer.chips);
+            sbPlayer.chips -= sbAmount;
+            sbPlayer.currentBet = sbAmount;
+            if (sbPlayer.chips === 0) sbPlayer.status = 'ALL-IN';
+
+            const bbPlayer = updatedPlayers[bbRealIndex];
+            const bbAmount = Math.min(config.blindBig, bbPlayer.chips);
+            bbPlayer.chips -= bbAmount;
+            bbPlayer.currentBet = bbAmount;
+            if (bbPlayer.chips === 0) bbPlayer.status = 'ALL-IN';
+
+            const pot = sbAmount + bbAmount;
+
+            const initialBoard = [
+                newDeck.pop()!, newDeck.pop()!, newDeck.pop()!,
+                newDeck.pop()!,
+                newDeck.pop()!
+            ];
+
+            // 5. Determine First Actor
+            const firstActorOffset = (bbOffset + 1) % activeCount;
+            const firstActorIndex = activePlayerIndices[(currentActiveDealerIndex + firstActorOffset) % activeCount];
+            const activePlayerId = updatedPlayers[firstActorIndex].id;
+
+            // --- History Init ---
+            const history = [`--- NEW HAND (Dealer: ${updatedPlayers[newDealerRealIndex].name}) ---`];
+            // history.push(`${sbPlayer.name} posts SB $${sbAmount}`);
+            // history.push(`${bbPlayer.name} posts BB $${bbAmount}`);
+
+            return {
+                ...prevState,
+                deck: newDeck,
+                board: initialBoard,
+                phase: GamePhase.PRE_FLOP,
+                pot,
+                pots: [], // Reset pots
+                players: updatedPlayers,
+                dealerIndex: newDealerRealIndex,
+                activePlayerId,
+                minRaise: config.blindBig,
+                winningHand: null,
+                isRunningOut: false,
+                handHistory: history,
+                handNotes: {}
+            };
+        });
+    }, [config]);
+
+    // Handle Start
+    const handleStartGame = () => {
+        setHasStarted(true);
+        startNewHand();
+    };
+
+    // Handle Rebuy — another buy-in out of the bankroll, if it covers one
+    const canRebuy = wealth >= config.startingStackHuman;
+    const handleRebuy = useCallback(() => {
+        if (!canRebuy) return;
+        onWealthChange(-config.startingStackHuman);
+        setGameState(prev => ({
+            ...prev,
+            players: prev.players.map(p =>
+                p.isHuman ? { ...p, chips: config.startingStackHuman, status: 'WAITING' as PlayerAction, isDealer: false } : p
+            )
+        }));
+        setTimeout(() => startNewHand(), 100);
+    }, [startNewHand, config.startingStackHuman, canRebuy, onWealthChange]);
+
+    // Handle Restart (Victory) — cash out the stack, buy in again
+    const handleRestartGame = useCallback(() => {
+        const hero = gameState.players.find(p => p.isHuman);
+        onWealthChange((hero?.chips ?? 0) - config.startingStackHuman);
+        statsBase.current = loadSeatStats(config.playerName); // the new table's stats start from zero: bank this one's
+        setGameState(initializeGame(config));
+        setTimeout(() => startNewHand(), 100);
+    }, [startNewHand, config, gameState.players, onWealthChange]);
+
+
+    // --- GAME EFFECTS for SUSPENSE (Runout & Showdown) ---
+
+    // 1. ALL-IN RUNOUT EFFECT
+    useEffect(() => {
+        if (gameState.isRunningOut) {
+            const timer = setTimeout(() => {
+                setGameState(prev => {
+                    let nextPhase = prev.phase;
+                    let stopRunout = false;
+
+                    if (prev.phase === GamePhase.PRE_FLOP) nextPhase = GamePhase.FLOP;
+                    else if (prev.phase === GamePhase.FLOP) nextPhase = GamePhase.TURN;
+                    else if (prev.phase === GamePhase.TURN) nextPhase = GamePhase.RIVER;
+                    else if (prev.phase === GamePhase.RIVER) {
+                        nextPhase = GamePhase.SHOWDOWN;
+                        stopRunout = true;
+                    }
+
+                    return {
+                        ...prev,
+                        phase: nextPhase,
+                        isRunningOut: !stopRunout
+                    };
+                });
+            }, skipping ? 150 : 1200);
+            return () => clearTimeout(timer);
+        }
+    }, [gameState.isRunningOut, gameState.phase, skipping]);
+
+    // 2. SHOWDOWN CALCULATION EFFECT
+    useEffect(() => {
+        if (gameState.phase === GamePhase.SHOWDOWN && !gameState.winningHand) {
+
+            const result = determineWinner(gameState.players, gameState.board, gameState.pots);
+
+            const payoutFn = (prev: GameState) => {
+                // Create a map for O(1) lookup of winnings
+                const winnings = new Map<string, number>();
+                result.payouts.forEach(p => {
+                    winnings.set(p.playerId, (winnings.get(p.playerId) || 0) + p.amount);
+                });
+
+                // Immutable update of players
+                const players = prev.players.map(p => {
+                    const amountWon = winnings.get(p.id);
+                    if (amountWon) {
+                        return { ...p, chips: p.chips + amountWon };
+                    }
+                    return p;
+                });
+
+                let focalId = result.primaryWinnerId;
+                const isHumanWinner = result.primaryWinnerId === prev.players.find(p => p.isHuman)?.id;
+
+                if (isHumanWinner && result.payouts.length > 0) {
+                    const runnerUp = players.find(p => !p.isHuman && p.isActive && p.id !== result.primaryWinnerId);
+                    if (runnerUp) focalId = runnerUp.id;
+                }
+
+                let desc = result.primaryHand.name;
+
+                if (result.isSplit) {
+                    desc = `Split Pot (${result.primaryHand.name})`;
+                }
+
+                return {
+                    ...prev,
+                    players,
+                    pot: 0,
+                    winningHand: {
+                        playerId: result.primaryWinnerId,
+                        cardIds: result.primaryHand.winningCardIds,
+                        description: desc,
+                        focalPlayerId: focalId
+                    }
+                };
+            };
+
+            const activePlayers = gameState.players.filter(p => p.status !== 'FOLDED' && p.status !== 'ELIMINATED');
+            const playerCount = activePlayers.length;
+            const totalRevealTime = skippingRef.current ? 300 : (playerCount * 1500) + 1000;
+
+            const timer = setTimeout(() => {
+                setGameState(p => payoutFn(p));
+            }, totalRevealTime);
+
+            return () => clearTimeout(timer);
+        }
+    }, [gameState.phase, gameState.winningHand, gameState.players, gameState.board, gameState.pots]);
+
+
+    // Handle Player Action (Human or AI)
+    const handlePlayerAction = useCallback((playerId: string, action: 'fold' | 'call' | 'raise' | 'check', amount?: number, reasoning?: string) => {
+        setAiIntent(null);
+
+        setGameState(prev => {
+            const players = [...prev.players];
+            const playerIndex = players.findIndex(p => p.id === playerId);
+
+            if (playerIndex === -1) return prev;
+
+            // Clone the player object to avoid mutating previous state (fixes duplicate reasoning in StrictMode)
+            const player = { ...players[playerIndex] };
+            players[playerIndex] = player;
+
+            // Update Reasoning History if provided
+            if (reasoning) {
+                const history = player.reasoningHistory || [];
+                const newEntry = `[${prev.phase}] ${reasoning}`;
+
+                // Check for duplicate to prevent spam (compare with last entry)
+                const lastEntry = history.length > 0 ? history[history.length - 1] : null;
+
+                if (lastEntry !== newEntry) {
+                    const newHistory = [...history, newEntry].slice(-10);
+                    player.reasoningHistory = newHistory;
+                }
+            }
+
+            let newPotDisplay = prev.pot;
+            const betBefore = player.currentBet;
+            const currentHighBet = Math.max(...players.map(p => p.currentBet));
+            const toCall = currentHighBet - player.currentBet;
+
+            // --- Log Building ---
+            let logEntry = `${prev.phase}: ${player.name} (${player.position}) `;
+
+            // Helper to count raises in current phase
+            const countRaisesInPhase = (history: string[], currentPhase: string) => {
+                let raises = 0;
+                for (let i = history.length - 1; i >= 0; i--) {
+                    if (history[i].includes(`--- ${currentPhase} ---`)) break;
+                    if (history[i].includes('RAISES') || history[i].includes('-BETS')) {
+                        raises++;
+                    }
+                }
+                return raises;
+            };
+
+            // --- 1. EXECUTE ACTION ---
+            if (action === 'fold') {
+                player.status = 'FOLDED';
+                player.isActive = false;
+                logEntry += `FOLDS`;
+            }
+            else if (action === 'check') {
+                if (toCall > 0) {
+                    // Invalid check (should not happen with correct AI/UI logic), treat as fold
+                    player.status = 'FOLDED';
+                    player.isActive = false;
+                    logEntry += `FOLDS (Invalid Check)`;
+                } else {
+                    player.status = 'CHECKED';
+                    logEntry += `CHECKS`;
+                }
+            }
+            else if (action === 'call') {
+                const actualCallAmount = Math.min(toCall, player.chips);
+
+                player.chips -= actualCallAmount;
+                player.currentBet += actualCallAmount;
+                newPotDisplay += actualCallAmount;
+
+                if (player.chips === 0) {
+                    player.status = 'ALL-IN';
+                    logEntry += `CALLS ALL-IN $${actualCallAmount}`;
+                } else if (actualCallAmount === 0 && toCall === 0) {
+                    player.status = 'CHECKED';
+                    logEntry += `CHECKS`;
+                } else {
+                    player.status = 'CALLED';
+                    logEntry += `CALLS $${actualCallAmount}`;
+                }
+            }
+            else if (action === 'raise') {
+                let totalBetAmount = amount || (currentHighBet + prev.minRaise);
+
+                const maxTotalBet = player.chips + player.currentBet;
+                if (totalBetAmount >= maxTotalBet) {
+                    totalBetAmount = maxTotalBet;
+                }
+
+                if (totalBetAmount < currentHighBet + prev.minRaise && totalBetAmount < maxTotalBet) {
+                    totalBetAmount = currentHighBet + prev.minRaise;
+                }
+
+                const addedChips = totalBetAmount - player.currentBet;
+                player.chips -= addedChips;
+                player.currentBet = totalBetAmount;
+                newPotDisplay += addedChips;
+
+                const raiseCount = countRaisesInPhase(prev.handHistory, prev.phase);
+                let raiseLabel = "RAISES";
+                if (raiseCount === 1) raiseLabel = "3-BETS";
+                else if (raiseCount === 2) raiseLabel = "4-BETS";
+                else if (raiseCount >= 3) raiseLabel = `${raiseCount + 2}-BETS`;
+
+                if (player.chips === 0) {
+                    player.status = 'ALL-IN';
+                    logEntry += `${raiseLabel} ALL-IN to $${totalBetAmount}`;
+                } else {
+                    player.status = 'RAISED';
+                    logEntry += `${raiseLabel} to $${totalBetAmount}`;
+                }
+            }
+
+            // HUD: count the action as it actually landed (a call of nothing is a check)
+            const paid = player.currentBet > betBefore;
+            player.stats = recordAction(
+                player.stats,
+                prev.phase,
+                player.status === 'FOLDED' ? 'fold' : action === 'raise' ? 'raise' : paid ? 'call' : 'check',
+                paid
+            );
+
+            const updatedHistory = [...prev.handHistory, logEntry];
+            const handNotes = reasoning ? { ...prev.handNotes, [updatedHistory.length - 1]: reasoning } : prev.handNotes;
+
+            // --- 2. CHECK FOR WINNER (Folded out) ---
+            const activePlayers = players.filter(p => p.status !== 'FOLDED' && p.status !== 'ELIMINATED');
+            if (activePlayers.length === 1) {
+                const winnerId = activePlayers[0].id;
+                const focalId = activePlayers[0].isHuman ? null : winnerId;
+
+                // Reset bets for all players AND award pot to winner (Immutable update)
+                const playersReset = players.map(p => {
+                    const isWinner = p.id === winnerId;
+                    return {
+                        ...p,
+                        currentBet: 0,
+                        chips: isWinner ? p.chips + newPotDisplay : p.chips
+                    };
+                });
+
+                return {
+                    ...prev,
+                    players: playersReset,
+                    pot: 0,
+                    pots: [],
+                    activePlayerId: null,
+                    winningHand: {
+                        playerId: winnerId,
+                        cardIds: [],
+                        description: 'Opponents Folded',
+                        focalPlayerId: focalId || undefined
+                    },
+                    handHistory: updatedHistory,
+                    handNotes
+                };
+            }            // --- 3. CHECK ROUND COMPLETION & AUTO-RUNOUT ---
+            const nextHighBet = Math.max(...players.map(p => p.currentBet));
+
+            const isRoundComplete = activePlayers.every(p => {
+                if (p.status === 'FOLDED' || p.status === 'ALL-IN' || p.status === 'ELIMINATED') return true;
+                if (p.status === 'WAITING' || p.status === 'THINKING') return false;
+                return p.currentBet === nextHighBet;
+            });
+
+            const playersWithChips = activePlayers.filter(p => p.status !== 'ALL-IN' && p.chips > 0);
+            const isAllInScenario = playersWithChips.length <= 1 && activePlayers.length >= 2;
+
+            if (isRoundComplete) {
+                // --- RESOLVE POTS (Simplified: Single Main Pot) ---
+                let newPots = prev.pots.map(pot => ({ ...pot }));
+                const roundBets = players.reduce((sum, p) => sum + p.currentBet, 0);
+
+                if (roundBets > 0) {
+                    let mainPot = newPots.find(p => p.kind === 'MAIN');
+                    if (!mainPot) {
+                        mainPot = {
+                            id: 'main-pot',
+                            amount: 0,
+                            eligiblePlayerIds: [],
+                            kind: 'MAIN'
+                        };
+                        newPots = [mainPot];
+                    }
+                    mainPot.amount += roundBets;
+                    mainPot.eligiblePlayerIds = players
+                        .filter(p => p.status !== 'FOLDED' && p.status !== 'ELIMINATED')
+                        .map(p => p.id);
+                }
+                const resolvedPots = newPots;
+
+                const nextPhase =
+                    prev.phase === GamePhase.PRE_FLOP ? GamePhase.FLOP :
+                        prev.phase === GamePhase.FLOP ? GamePhase.TURN :
+                            prev.phase === GamePhase.TURN ? GamePhase.RIVER : GamePhase.SHOWDOWN;
+
+                let startRunout = false;
+                if (isAllInScenario && nextPhase !== GamePhase.SHOWDOWN) {
+                    startRunout = true;
+                }
+
+                // Reset bets
+                const playersReset = players.map(p => ({
+                    ...p,
+                    currentBet: 0,
+                    status: (p.status === 'FOLDED' || p.status === 'ALL-IN' || p.status === 'ELIMINATED') ? p.status : 'WAITING' as PlayerAction
+                }));
+
+                // Determine first actor
+                let firstActorIndex = (prev.dealerIndex + 1) % players.length;
+                let loops = 0;
+                while (
+                    (playersReset[firstActorIndex].status === 'FOLDED' || playersReset[firstActorIndex].status === 'ALL-IN' || playersReset[firstActorIndex].status === 'ELIMINATED')
+                    && loops < players.length
+                ) {
+                    firstActorIndex = (firstActorIndex + 1) % players.length;
+                    loops++;
+                }
+
+                const nextActiveId = (nextPhase === GamePhase.SHOWDOWN || startRunout) ? null : playersReset[firstActorIndex].id;
+
+                // Add Phase change to Log
+                if (nextPhase !== GamePhase.SHOWDOWN) {
+                    updatedHistory.push(`--- ${nextPhase} ---`);
+                }
+
+                return {
+                    ...prev,
+                    players: playersReset,
+                    pot: newPotDisplay,
+                    pots: resolvedPots,
+                    phase: nextPhase,
+                    activePlayerId: nextActiveId,
+                    isRunningOut: startRunout,
+                    handHistory: updatedHistory,
+                    handNotes
+                };
+            }
+
+            // --- 4. NEXT TURN (Same Street) ---
+            let nextIndex = (playerIndex + 1) % players.length;
+            let loops = 0;
+            while (
+                (players[nextIndex].status === 'FOLDED' || players[nextIndex].status === 'ALL-IN' || players[nextIndex].status === 'ELIMINATED')
+                && loops < players.length
+            ) {
+                nextIndex = (nextIndex + 1) % players.length;
+                loops++;
+            }
+
+            return {
+                ...prev,
+                players,
+                pot: newPotDisplay,
+                activePlayerId: players[nextIndex].id,
+                handHistory: updatedHistory,
+                handNotes
+            };
+        });
+    }, []);
+
+    // AI Turn Logic
+    useEffect(() => {
+        if (!gameState.activePlayerId || gameState.isRunningOut) return;
+        const activePlayer = gameState.players.find(p => p.id === gameState.activePlayerId);
+
+        if (activePlayer?.isHuman) {
+            aiProcessingRef.current = false;
+        }
+
+        if (activePlayer && !activePlayer.isHuman && activePlayer.isActive && activePlayer.status !== 'ALL-IN' && activePlayer.status !== 'ELIMINATED') {
+            if (aiProcessingRef.current) return;
+            aiProcessingRef.current = true;
+
+            const makeAIMove = async () => {
+                const highBet = Math.max(...gameState.players.map(p => p.currentBet));
+                const toCall = highBet - activePlayer.currentBet;
+
+                const decision = await getAIDecision(
+                    activePlayer,
+                    gameState.players,
+                    gameState.board,
+                    gameState.pot,
+                    gameState.phase,
+                    highBet,
+                    config.blindBig,
+                    gameState.handHistory,
+                    activePlayer.reasoningHistory,
+                    config.aiModel
+                );
+
+                console.group(`🤖 AI Decision: ${activePlayer.name}`);
+                if (decision.reasoning) {
+                    console.log(`%cReasoning: ${decision.reasoning}`, 'color: #d4af37; font-weight: bold;');
+                }
+                console.log(`Action: ${decision.action.toUpperCase()} ${decision.amount ? `($${decision.amount})` : ''}`);
+                console.groupEnd();
+
+                // Logic to visually distinguish Check vs Call in intent UI
+                let visualAction: string = decision.action;
+                if (decision.action === 'call' && toCall === 0) {
+                    visualAction = 'check';
+                }
+
+                setAiIntent({
+                    playerId: activePlayer.id,
+                    action: visualAction,
+                    amount: decision.amount
+                });
+
+                setTimeout(() => {
+                    handlePlayerAction(activePlayer.id, decision.action, decision.amount, decision.reasoning);
+                    aiProcessingRef.current = false;
+                }, skippingRef.current ? 0 : 1000);
+            };
+
+            makeAIMove();
+        }
+    }, [gameState.activePlayerId, gameState.players, gameState.phase, gameState.pot, gameState.board, handlePlayerAction, gameState.isRunningOut, config.blindBig, config.aiModel, gameState.handHistory]);
+
+    // Derived State
+    const humanPlayer = gameState.players.find(p => p.isHuman);
+    const aiPlayers = gameState.players.filter(p => !p.isHuman);
+
+    const isHumanTurn = gameState.activePlayerId === humanPlayer?.id;
+    const humanToCall = humanPlayer ? getAmountToCall(humanPlayer.id) : 0;
+    const humanHasFolded = humanPlayer?.status === 'FOLDED' || !humanPlayer?.isActive;
+
+    const isHandComplete = gameState.activePlayerId === null && !gameState.isRunningOut && gameState.winningHand !== null;
+    const isHumanBusted = humanPlayer && humanPlayer.chips <= 0 && isHandComplete;
+
+    const activeAiCount = aiPlayers.filter(p => p.chips > 0).length;
+    const isTournamentWon = activeAiCount === 0 && (humanPlayer && humanPlayer.chips > 0) && isHandComplete;
+
+    let gameStatus: 'active' | 'complete' | 'won' | 'busted' = 'active';
+    if (isHandComplete) {
+        if (isTournamentWon) gameStatus = 'won';
+        else if (isHumanBusted) gameStatus = 'busted';
+        else gameStatus = 'complete';
+    }
+
+    // Each finished hand adds to every opponent's record across sessions (per style),
+    // so the lobby can show how a style you set actually played
+    const statsBase = useRef(loadSeatStats(config.playerName));
+    useEffect(() => {
+        if (!gameState.winningHand || isLocalGame(config)) return;
+        const session: Record<string, NonNullable<Player['stats']>> = {};
+        gameState.players.forEach(p => {
+            if (!p.isHuman && p.styleKey && p.stats) session[entryKey(p.name, p.styleKey)] = p.stats;
+        });
+        saveSessionStats(config.playerName, statsBase.current, session);
+    }, [gameState.winningHand]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // A skipped hand deals the next one itself — unless the table is over for you
+    useEffect(() => {
+        if (skipping && gameStatus === 'complete') startNewHand();
+    }, [skipping, gameStatus, startNewHand]);
+
+    if (!humanPlayer) return <div>{t.game.loading}</div>;
+
+    if (settings.uiStyle === "frank") return (
+        <div className="flex flex-col h-full w-full z-10 overflow-hidden relative">
+            <button
+                onClick={() => onExit(humanPlayer.chips)}
+                className="absolute top-4 left-4 z-50 p-2 rounded-full bg-black/40 text-white/30 hover:text-white hover:bg-white/10 transition-all backdrop-blur-md"
+                title={t.game.exitTitle}
+                aria-label={t.game.exitTitle}
+            >
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+            </button>
+
+            {/* READY OVERLAY */}
+            {!hasStarted && (
+                <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md animate-in fade-in duration-500">
+                    <div className="flex flex-col items-center gap-4 md:gap-6 p-4 md:p-8 relative">
+                        <div className="absolute inset-0 bg-[#d4af37]/5 blur-3xl rounded-full" />
+                        <div className="text-base md:text-2xl font-light tracking-widest text-white font-sans uppercase relative z-10 text-center">
+                            {t.game.tableReady}
+                        </div>
+                        <ActionButton
+                            onClick={handleStartGame}
+                            variant="gold"
+                            className="px-8 py-4 md:px-12 md:py-6 text-xs md:text-lg tracking-[0.2em] md:tracking-[0.3em] relative z-10 shadow-[0_0_30px_rgba(212,175,55,0.2)] md:shadow-[0_0_50px_rgba(212,175,55,0.3)] hover:shadow-[0_0_70px_rgba(212,175,55,0.5)]"
+                        >
+                            {t.game.imReady}
+                        </ActionButton>
+                    </div>
+                </div>
+            )}
+
+            <FrankTableLayout
+              roster={<TableRoster players={gameState.players} activePlayerId={gameState.activePlayerId} bigBlind={config.blindBig} buyIn={config.startingStackHuman} />}
+              log={<HandLog history={gameState.handHistory} notes={gameState.handNotes ?? {}} players={gameState.players} phase={gameState.phase} activePlayerId={gameState.activePlayerId} />}
+            >
+            {/* AI Stratum: Flies in from TOP */}
+            <div className="frank-opponents-region w-full shrink-0 animate-slide-in-top z-30">
+                <FrankAIStratum
+                    players={aiPlayers}
+                    activePlayerId={gameState.activePlayerId}
+                    phase={gameState.phase}
+                    humanHasFolded={humanHasFolded}
+                    winningHand={gameState.winningHand}
+                    aiIntent={aiIntent}
+                />
+            </div>
+
+            {/* Table Stratum: Zooms/Fades in with Delay */}
+            <div className="frank-board-region w-full grow flex flex-col justify-center animate-zoom-fade-in z-10" style={{ animationDelay: '0.3s' }}>
+                <FrankTableStratum
+                    winnerName={gameState.players.find(p => p.id === gameState.winningHand?.playerId)?.name}
+                    pot={gameState.pot}
+                    board={gameState.board}
+                    phase={gameState.phase}
+                    winningHand={gameState.winningHand}
+                />
+            </div>
+
+            {/* Player Stratum: Flies in from BOTTOM */}
+            <div className="frank-player-region w-full shrink-0 animate-slide-in-bottom z-30">
+                <PlayerStratum
+                    board={gameState.board}
+                    onOpenSettings={onOpenSettings}
+                    onSkipHand={() => setSkipping(true)}
+                    skipping={skipping}
+                    player={humanPlayer}
+                    potSize={gameState.pot}
+                    onAction={(a, amt) => handlePlayerAction(humanPlayer.id, a, amt)}
+                    canAct={isHumanTurn}
+                    toCall={humanToCall}
+                    gameStatus={gameStatus}
+                    onNextHand={startNewHand}
+                    onRebuy={handleRebuy}
+                    canRebuy={canRebuy}
+                    onRestart={handleRestartGame}
+                    winningHand={gameState.winningHand}
+                    bigBlind={config.blindBig}
+                    phase={gameState.phase}
+                />
+            </div>
+            </FrankTableLayout>
+        </div>
+    );
+
+    return (
+        <div
+            className="h-full w-full bg-transparent overflow-hidden relative"
+            style={{
+                paddingTop: 'env(safe-area-inset-top)',
+                paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom))',
+            }}
+        >
+            {/* READY OVERLAY */}
+            {!hasStarted && (
+                <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-6 bg-black/80 backdrop-blur-md">
+                    <span className="text-[15px] text-white/55">{t.game.tableReady}</span>
+                    <button
+                        type="button"
+                        onClick={handleStartGame}
+                        className="h-[52px] px-10 rounded-full bg-white text-black text-[16px] active:scale-[0.97] transition-transform cursor-pointer"
+                    >
+                        {t.game.imReady}
+                    </button>
+                </div>
+            )}
+
+            {/* One phone-wide column: seats, board, you. On a desktop, the seats in
+                full on its left and the hand as it happens on its right. */}
+            <div className="h-full w-full flex justify-center lg:gap-6 lg:px-6">
+            {hasStarted && (
+                <div className="hidden lg:block w-[260px] xl:w-[300px] shrink-0 pt-14 pb-2 animate-in fade-in duration-500">
+                    <TableRoster
+                        players={gameState.players}
+                        activePlayerId={gameState.activePlayerId}
+                        bigBlind={config.blindBig}
+                        buyIn={config.startingStackHuman}
+                    />
+                </div>
+            )}
+            <div className="offsuit-game-column h-full w-full max-w-[480px] min-w-0 flex flex-col overflow-y-auto sm:overflow-visible">
+                <div className="offsuit-topbar shrink-0 h-12 sm:h-14 flex items-center px-3">
+                    <button
+                        type="button"
+                        onClick={() => onExit(humanPlayer.chips)}
+                        className="p-2 text-white hover:opacity-60 transition-opacity cursor-pointer"
+                        title={t.game.exitTitle}
+                        aria-label={t.game.exitTitle}
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>
+                    </button>
+                    {isLocalGame(config) && <span className="ml-2 text-sm text-white/60">{t.venues.local.name} · {t.venues.local.desc}</span>}
+                </div>
+
+                <div className="offsuit-ai-region shrink-0 animate-slide-in-top">
+                    <AIStratum
+                        players={aiPlayers}
+                        activePlayerId={gameState.activePlayerId}
+                        phase={gameState.phase}
+                        humanHasFolded={humanHasFolded}
+                        winningHand={gameState.winningHand}
+                        aiIntent={aiIntent}
+                    />
+                </div>
+
+                <div className="offsuit-board-region flex-1 min-h-0 flex flex-col justify-center animate-zoom-fade-in" style={{ animationDelay: '0.3s' }}>
+                    <TableStratum
+                        pot={gameState.pot}
+                        board={gameState.board}
+                        phase={gameState.phase}
+                        winningHand={gameState.winningHand}
+                    />
+                </div>
+
+                <div className="offsuit-player-region shrink-0 animate-slide-in-bottom">
+                    <PlayerStratum
+                        onOpenSettings={onOpenSettings}
+                        player={humanPlayer}
+                        potSize={gameState.pot}
+                        board={gameState.board}
+                        onAction={(a, amt) => handlePlayerAction(humanPlayer.id, a, amt)}
+                        canAct={isHumanTurn}
+                        toCall={humanToCall}
+                        gameStatus={gameStatus}
+                        onNextHand={startNewHand}
+                        onSkipHand={() => setSkipping(true)}
+                        skipping={skipping}
+                        onRebuy={handleRebuy}
+                        canRebuy={canRebuy}
+                        onRestart={handleRestartGame}
+                        winningHand={gameState.winningHand}
+                        bigBlind={config.blindBig}
+                        phase={gameState.phase}
+                    />
+                </div>
+            </div>
+            {hasStarted && (
+                <div className="hidden lg:block w-[260px] xl:w-[300px] shrink-0 pt-14 pb-2 animate-in fade-in duration-500">
+                    <HandLog
+                        history={gameState.handHistory}
+                        notes={gameState.handNotes ?? {}}
+                        players={gameState.players}
+                        phase={gameState.phase}
+                        activePlayerId={gameState.activePlayerId}
+                    />
+                </div>
+            )}
+            </div>
+        </div>
+    );
+};
